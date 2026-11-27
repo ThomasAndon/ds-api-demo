@@ -336,6 +336,26 @@ type chatRequest struct {
 	} `json:"title"`
 }
 
+type openAIMessage struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
+type openAIRequest struct {
+	Model         string          `json:"model"`
+	Messages      []openAIMessage `json:"messages"`
+	Temperature   float64         `json:"temperature"`
+	Stream        bool            `json:"stream"`
+	StreamOptions map[string]bool `json:"stream_options"`
+}
+
+// 官方前端会携带 DeepSeek 专用字段。这里只解析本项目需要的字段，其他字段兼容接收但不会透传。
+func decodeChatRequest(reader io.Reader) (chatRequest, error) {
+	var request chatRequest
+	err := json.NewDecoder(reader).Decode(&request)
+	return request, err
+}
+
 func textContent(v any) string {
 	switch x := v.(type) {
 	case string:
@@ -360,9 +380,39 @@ func textContent(v any) string {
 	}
 }
 
+func buildOpenAIRequest(in chatRequest, cfg llmConfig) (openAIRequest, string, error) {
+	messages := make([]openAIMessage, 0, len(in.Messages))
+	lastUser := ""
+	for _, message := range in.Messages {
+		// latest_reminder、system、thinking、tools 等均不进入 OpenAI 上游消息。
+		if message.Role != "user" && message.Role != "assistant" {
+			continue
+		}
+		content := textContent(message.Content)
+		if content == "" {
+			continue
+		}
+		messages = append(messages, openAIMessage{Role: message.Role, Content: content})
+		if message.Role == "user" {
+			lastUser = content
+		}
+	}
+	if len(messages) == 0 {
+		return openAIRequest{}, "", errors.New("no user or assistant text")
+	}
+	return openAIRequest{
+		Model:         cfg.Model,
+		Messages:      messages,
+		Temperature:   cfg.Temperature,
+		Stream:        true,
+		StreamOptions: map[string]bool{"include_usage": true},
+	}, lastUser, nil
+}
+
 func (a *app) chat(w http.ResponseWriter, r *http.Request) {
-	var in chatRequest
-	if readJSON(r, &in) != nil || len(in.Messages) == 0 {
+	r.Body = http.MaxBytesReader(w, r.Body, maxBody)
+	in, err := decodeChatRequest(r.Body)
+	if err != nil || len(in.Messages) == 0 {
 		writeError(w, 400, "无效聊天请求")
 		return
 	}
@@ -375,30 +425,11 @@ func (a *app) chat(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 503, "请先在 /admin 配置 API Key")
 		return
 	}
-	messages := []map[string]string{}
-	lastUser := ""
-	for _, m := range in.Messages {
-		role := m.Role
-		if role == "latest_reminder" {
-			continue
-		}
-		if role != "user" && role != "assistant" {
-			continue
-		}
-		content := textContent(m.Content)
-		if content == "" {
-			continue
-		}
-		messages = append(messages, map[string]string{"role": role, "content": content})
-		if role == "user" {
-			lastUser = content
-		}
-	}
-	if len(messages) == 0 {
+	payload, lastUser, err := buildOpenAIRequest(in, cfg)
+	if err != nil {
 		writeError(w, 400, "没有可发送的文本")
 		return
 	}
-	payload := map[string]any{"model": cfg.Model, "messages": messages, "temperature": cfg.Temperature, "stream": true, "stream_options": map[string]bool{"include_usage": true}}
 	body, _ := json.Marshal(payload)
 	endpoint, err := completionURL(cfg.BaseURL)
 	if err != nil {

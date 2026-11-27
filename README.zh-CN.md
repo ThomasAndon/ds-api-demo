@@ -15,6 +15,10 @@ OpenAI 兼容 URL、API Key、模型和温度由 `/admin` 配置，API Key 不�
 - `/api/admin/config`：仅后台登录后可用的模型配置接口。
 - `GET /healthz`：应用和数据库健康检查。
 
+官方前端请求中的 `system`、`latest_reminder`、`thinking`、`safety_check`、`tools`
+和 `title` 只用于兼容接收，不会透传给上游。上游请求只包含后台选择的模型、温度、
+普通 `user/assistant` 消息以及流式参数，本项目不发送 system 消息。
+
 生产部署见 [`deploy/README.md`](deploy/README.md)。
 
 ---
