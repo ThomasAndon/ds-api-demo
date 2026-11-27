@@ -4,6 +4,9 @@
 OpenAI 兼容 URL、API Key、模型和温度由 `/admin` 配置，API Key 不会下发到浏览器。
 会话、重命名和删除均持久化到 MySQL。
 
+后台支持保存多套 LLM 凭据，每套独立包含名称、URL、加密 API Key、模型和温度。
+列表中只有一套处于当前启用状态，可一键切换；前台密码是所有凭据共用的全局设置。
+
 后台默认 API 根地址为 `https://la-api.vxvxvx.top/v1`，可通过上游 `/models`
 获取模型列表。前台保持官方项目的界面和 API Key 文案不变；输入值仅用于本站访问控制，
 不会作为上游 API Key 发送。
@@ -12,7 +15,7 @@ OpenAI 兼容 URL、API Key、模型和温度由 `/admin` 配置，API Key 不�
 
 - `POST /api/chat/completions`：浏览器到 Go 的流式 LLM 接口；Go 再请求后台配置的 OpenAI 兼容服务。
 - `/api/sessions`：会话列表、详情、保存、重命名、删除和批量导入。
-- `/api/admin/config`：仅后台登录后可用的模型配置接口。
+- `/api/admin/profiles`：仅后台登录后可用的多凭据新增、编辑、删除和切换接口。
 - `GET /healthz`：应用和数据库健康检查。
 
 官方前端请求中的 `system`、`latest_reminder`、`thinking`、`safety_check`、`tools`

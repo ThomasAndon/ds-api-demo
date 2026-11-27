@@ -12,6 +12,6 @@
 构建顺序：先执行 `pnpm install --frozen-lockfile && pnpm build`，再执行
 `CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o ds-api-demo .`。
 
-程序首次启动会在 MySQL `redir` 库自动建立 `llm_config` 和
-`chat_sessions` 两张表。`CONFIG_SECRET` 用于 AES-GCM 加密 API Key，部署后不要更换，
+程序首次启动会在 MySQL `redir` 库自动建立 `llm_config`、`llm_profiles` 和
+`chat_sessions` 三张表。`CONFIG_SECRET` 用于 AES-GCM 加密 API Key，部署后不要更换，
 否则已有 API Key 无法解密。

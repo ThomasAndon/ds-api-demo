@@ -21,6 +21,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -48,6 +49,17 @@ type llmConfig struct {
 	Temperature       float64 `json:"temperature"`
 	AccessPassword    string  `json:"access_password,omitempty"`
 	AccessPasswordSet bool    `json:"access_password_set"`
+}
+
+type llmProfile struct {
+	ID          int64   `json:"id"`
+	Name        string  `json:"name"`
+	BaseURL     string  `json:"base_url"`
+	APIKey      string  `json:"api_key,omitempty"`
+	APIKeySet   bool    `json:"api_key_set"`
+	Model       string  `json:"model"`
+	Temperature float64 `json:"temperature"`
+	Active      bool    `json:"active"`
 }
 
 type sessionSummary struct {
@@ -104,6 +116,12 @@ func main() {
 	mux.HandleFunc("GET /api/admin/config", a.adminOnly(a.getConfig))
 	mux.HandleFunc("PUT /api/admin/config", a.adminOnly(a.putConfig))
 	mux.HandleFunc("POST /api/admin/models", a.adminOnly(a.listModels))
+	mux.HandleFunc("GET /api/admin/profiles", a.adminOnly(a.listProfiles))
+	mux.HandleFunc("POST /api/admin/profiles", a.adminOnly(a.createProfile))
+	mux.HandleFunc("PUT /api/admin/profiles/{id}", a.adminOnly(a.updateProfile))
+	mux.HandleFunc("DELETE /api/admin/profiles/{id}", a.adminOnly(a.deleteProfile))
+	mux.HandleFunc("POST /api/admin/profiles/{id}/activate", a.adminOnly(a.activateProfile))
+	mux.HandleFunc("PUT /api/admin/access", a.adminOnly(a.putAccessPassword))
 	mux.Handle("/admin/", http.StripPrefix("/admin/", http.FileServer(http.Dir(filepath.Join(a.webRoot, "admin")))))
 	mux.HandleFunc("GET /admin", func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/admin/", http.StatusMovedPermanently)
@@ -118,6 +136,7 @@ func main() {
 func migrate(ctx context.Context, db *sql.DB) error {
 	statements := []string{
 		`CREATE TABLE IF NOT EXISTS llm_config (id TINYINT UNSIGNED NOT NULL PRIMARY KEY, base_url VARCHAR(1024) NOT NULL, api_key_enc TEXT NOT NULL, model VARCHAR(255) NOT NULL, system_prompt TEXT NOT NULL, temperature DECIMAL(4,3) NOT NULL DEFAULT 0.700, access_password_hash CHAR(64) NOT NULL DEFAULT '', updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+		`CREATE TABLE IF NOT EXISTS llm_profiles (id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY, name VARCHAR(100) NOT NULL, base_url VARCHAR(1024) NOT NULL, api_key_enc TEXT NOT NULL, model VARCHAR(255) NOT NULL, temperature DECIMAL(4,3) NOT NULL DEFAULT 0.700, is_active TINYINT(1) NOT NULL DEFAULT 0, created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, INDEX idx_llm_profiles_active (is_active)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
 		`CREATE TABLE IF NOT EXISTS chat_sessions (id VARCHAR(80) NOT NULL PRIMARY KEY, title VARCHAR(255) NOT NULL DEFAULT '', session_json LONGTEXT NOT NULL, created_at BIGINT NOT NULL, updated_at BIGINT NOT NULL, INDEX idx_chat_sessions_updated (updated_at)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
 	}
 	for _, statement := range statements {
@@ -132,6 +151,18 @@ func migrate(ctx context.Context, db *sql.DB) error {
 		return err
 	}
 	_, _ = db.ExecContext(ctx, `UPDATE llm_config SET base_url='https://la-api.vxvxvx.top/v1', model='gpt-5.3-codex', system_prompt='' WHERE api_key_enc='' AND base_url='https://api.deepseek.com/v1'`)
+	if _, err := db.ExecContext(ctx, `INSERT INTO llm_profiles(name,base_url,api_key_enc,model,temperature,is_active) SELECT '现有配置',base_url,api_key_enc,model,temperature,1 FROM llm_config WHERE id=1 AND NOT EXISTS (SELECT 1 FROM llm_profiles)`); err != nil {
+		return err
+	}
+	var activeCount int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM llm_profiles WHERE is_active=1`).Scan(&activeCount); err != nil {
+		return err
+	}
+	if activeCount == 0 {
+		if _, err := db.ExecContext(ctx, `UPDATE llm_profiles SET is_active=1 ORDER BY id LIMIT 1`); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -650,7 +681,7 @@ func (a *app) readConfig(ctx context.Context) (llmConfig, error) {
 	var c llmConfig
 	var enc string
 	var accessHash string
-	err := a.db.QueryRowContext(ctx, `SELECT base_url,api_key_enc,model,system_prompt,temperature,access_password_hash FROM llm_config WHERE id=1`).Scan(&c.BaseURL, &enc, &c.Model, &c.SystemPrompt, &c.Temperature, &accessHash)
+	err := a.db.QueryRowContext(ctx, `SELECT p.base_url,p.api_key_enc,p.model,p.temperature,c.access_password_hash FROM llm_profiles p JOIN llm_config c ON c.id=1 WHERE p.is_active=1 ORDER BY p.id LIMIT 1`).Scan(&c.BaseURL, &enc, &c.Model, &c.Temperature, &accessHash)
 	if err != nil {
 		return c, err
 	}
@@ -662,6 +693,23 @@ func (a *app) readConfig(ctx context.Context) (llmConfig, error) {
 		c.APIKeySet = c.APIKey != ""
 	}
 	c.AccessPasswordSet = accessHash != ""
+	return c, nil
+}
+
+func (a *app) readProfileConfig(ctx context.Context, id int64) (llmConfig, error) {
+	var c llmConfig
+	var enc string
+	err := a.db.QueryRowContext(ctx, `SELECT base_url,api_key_enc,model,temperature FROM llm_profiles WHERE id=?`, id).Scan(&c.BaseURL, &enc, &c.Model, &c.Temperature)
+	if err != nil {
+		return c, err
+	}
+	if enc != "" {
+		c.APIKey, err = a.decrypt(enc)
+		if err != nil {
+			return c, err
+		}
+		c.APIKeySet = c.APIKey != ""
+	}
 	return c, nil
 }
 
@@ -726,7 +774,7 @@ func (a *app) putConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	var enc string
 	if c.APIKey == "" {
-		if err := a.db.QueryRowContext(r.Context(), `SELECT api_key_enc FROM llm_config WHERE id=1`).Scan(&enc); err != nil {
+		if err := a.db.QueryRowContext(r.Context(), `SELECT api_key_enc FROM llm_profiles WHERE is_active=1 ORDER BY id LIMIT 1`).Scan(&enc); err != nil {
 			writeError(w, 500, "读取配置失败")
 			return
 		}
@@ -746,11 +794,199 @@ func (a *app) putConfig(w http.ResponseWriter, r *http.Request) {
 	if strings.TrimSpace(c.AccessPassword) != "" {
 		accessHash = a.hashPassword(strings.TrimSpace(c.AccessPassword))
 	}
-	if _, err := a.db.ExecContext(r.Context(), `UPDATE llm_config SET base_url=?,api_key_enc=?,model=?,system_prompt='',temperature=?,access_password_hash=? WHERE id=1`, c.BaseURL, enc, c.Model, c.Temperature, accessHash); err != nil {
+	tx, err := a.db.BeginTx(r.Context(), nil)
+	if err != nil {
+		writeError(w, 500, "保存配置失败")
+		return
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(r.Context(), `UPDATE llm_profiles SET base_url=?,api_key_enc=?,model=?,temperature=? WHERE is_active=1`, c.BaseURL, enc, c.Model, c.Temperature); err != nil {
+		writeError(w, 500, "保存配置失败")
+		return
+	}
+	if _, err := tx.ExecContext(r.Context(), `UPDATE llm_config SET access_password_hash=? WHERE id=1`, accessHash); err != nil {
+		writeError(w, 500, "保存配置失败")
+		return
+	}
+	if err := tx.Commit(); err != nil {
 		writeError(w, 500, "保存配置失败")
 		return
 	}
 	w.WriteHeader(204)
+}
+
+func validateProfile(profile *llmProfile) error {
+	profile.Name = strings.TrimSpace(profile.Name)
+	profile.BaseURL = strings.TrimSpace(profile.BaseURL)
+	profile.Model = strings.TrimSpace(profile.Model)
+	if profile.Name == "" || len([]rune(profile.Name)) > 100 {
+		return errors.New("invalid name")
+	}
+	if _, err := completionURL(profile.BaseURL); err != nil {
+		return err
+	}
+	if profile.Model == "" || len(profile.Model) > 255 || profile.Temperature < 0 || profile.Temperature > 2 {
+		return errors.New("invalid model or temperature")
+	}
+	return nil
+}
+
+func profileID(r *http.Request) (int64, error) {
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil || id <= 0 {
+		return 0, errors.New("invalid profile id")
+	}
+	return id, nil
+}
+
+func (a *app) listProfiles(w http.ResponseWriter, r *http.Request) {
+	rows, err := a.db.QueryContext(r.Context(), `SELECT id,name,base_url,api_key_enc,model,temperature,is_active FROM llm_profiles ORDER BY is_active DESC,id`)
+	if err != nil {
+		writeError(w, 500, "读取凭据失败")
+		return
+	}
+	defer rows.Close()
+	profiles := []llmProfile{}
+	for rows.Next() {
+		var profile llmProfile
+		var enc string
+		var active int
+		if err := rows.Scan(&profile.ID, &profile.Name, &profile.BaseURL, &enc, &profile.Model, &profile.Temperature, &active); err != nil {
+			writeError(w, 500, "读取凭据失败")
+			return
+		}
+		profile.APIKeySet = enc != ""
+		profile.Active = active == 1
+		profiles = append(profiles, profile)
+	}
+	writeJSON(w, 200, profiles)
+}
+
+func (a *app) createProfile(w http.ResponseWriter, r *http.Request) {
+	var profile llmProfile
+	if readJSON(r, &profile) != nil || validateProfile(&profile) != nil || strings.TrimSpace(profile.APIKey) == "" {
+		writeError(w, 400, "请完整填写名称、URL、API Key、模型和温度")
+		return
+	}
+	enc, err := a.encrypt(strings.TrimSpace(profile.APIKey))
+	if err != nil {
+		writeError(w, 500, "加密 API Key 失败")
+		return
+	}
+	result, err := a.db.ExecContext(r.Context(), `INSERT INTO llm_profiles(name,base_url,api_key_enc,model,temperature,is_active) VALUES(?,?,?,?,?,0)`, profile.Name, profile.BaseURL, enc, profile.Model, profile.Temperature)
+	if err != nil {
+		writeError(w, 500, "新增凭据失败")
+		return
+	}
+	id, _ := result.LastInsertId()
+	writeJSON(w, http.StatusCreated, map[string]int64{"id": id})
+}
+
+func (a *app) updateProfile(w http.ResponseWriter, r *http.Request) {
+	id, err := profileID(r)
+	if err != nil {
+		writeError(w, 400, "无效凭据 ID")
+		return
+	}
+	var profile llmProfile
+	if readJSON(r, &profile) != nil || validateProfile(&profile) != nil {
+		writeError(w, 400, "请检查名称、URL、模型和温度")
+		return
+	}
+	var enc string
+	if err := a.db.QueryRowContext(r.Context(), `SELECT api_key_enc FROM llm_profiles WHERE id=?`, id).Scan(&enc); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(w, 404, "凭据不存在")
+		} else {
+			writeError(w, 500, "读取凭据失败")
+		}
+		return
+	}
+	if strings.TrimSpace(profile.APIKey) != "" {
+		enc, err = a.encrypt(strings.TrimSpace(profile.APIKey))
+		if err != nil {
+			writeError(w, 500, "加密 API Key 失败")
+			return
+		}
+	}
+	if _, err := a.db.ExecContext(r.Context(), `UPDATE llm_profiles SET name=?,base_url=?,api_key_enc=?,model=?,temperature=? WHERE id=?`, profile.Name, profile.BaseURL, enc, profile.Model, profile.Temperature, id); err != nil {
+		writeError(w, 500, "保存凭据失败")
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (a *app) activateProfile(w http.ResponseWriter, r *http.Request) {
+	id, err := profileID(r)
+	if err != nil {
+		writeError(w, 400, "无效凭据 ID")
+		return
+	}
+	tx, err := a.db.BeginTx(r.Context(), nil)
+	if err != nil {
+		writeError(w, 500, "切换失败")
+		return
+	}
+	defer tx.Rollback()
+	var exists int
+	if err := tx.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM llm_profiles WHERE id=?`, id).Scan(&exists); err != nil || exists == 0 {
+		writeError(w, 404, "凭据不存在")
+		return
+	}
+	if _, err := tx.ExecContext(r.Context(), `UPDATE llm_profiles SET is_active=0 WHERE is_active=1`); err != nil {
+		writeError(w, 500, "切换失败")
+		return
+	}
+	if _, err := tx.ExecContext(r.Context(), `UPDATE llm_profiles SET is_active=1 WHERE id=?`, id); err != nil {
+		writeError(w, 500, "切换失败")
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		writeError(w, 500, "切换失败")
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (a *app) deleteProfile(w http.ResponseWriter, r *http.Request) {
+	id, err := profileID(r)
+	if err != nil {
+		writeError(w, 400, "无效凭据 ID")
+		return
+	}
+	var active int
+	if err := a.db.QueryRowContext(r.Context(), `SELECT is_active FROM llm_profiles WHERE id=?`, id).Scan(&active); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(w, 404, "凭据不存在")
+		} else {
+			writeError(w, 500, "读取凭据失败")
+		}
+		return
+	}
+	if active == 1 {
+		writeError(w, 400, "当前使用中的凭据不能删除，请先切换")
+		return
+	}
+	if _, err := a.db.ExecContext(r.Context(), `DELETE FROM llm_profiles WHERE id=?`, id); err != nil {
+		writeError(w, 500, "删除凭据失败")
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (a *app) putAccessPassword(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Password string `json:"password"`
+	}
+	if readJSON(r, &body) != nil || strings.TrimSpace(body.Password) == "" {
+		writeError(w, 400, "请输入新的前台密码")
+		return
+	}
+	if _, err := a.db.ExecContext(r.Context(), `UPDATE llm_config SET access_password_hash=? WHERE id=1`, a.hashPassword(strings.TrimSpace(body.Password))); err != nil {
+		writeError(w, 500, "保存前台密码失败")
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (a *app) accessLogin(w http.ResponseWriter, r *http.Request) {
@@ -815,14 +1051,21 @@ func modelsURL(raw string) (string, error) {
 
 func (a *app) listModels(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		BaseURL string `json:"base_url"`
-		APIKey  string `json:"api_key"`
+		ProfileID int64  `json:"profile_id"`
+		BaseURL   string `json:"base_url"`
+		APIKey    string `json:"api_key"`
 	}
 	if readJSON(r, &body) != nil {
 		writeError(w, 400, "参数无效")
 		return
 	}
-	cfg, err := a.readConfig(r.Context())
+	var cfg llmConfig
+	var err error
+	if body.ProfileID > 0 {
+		cfg, err = a.readProfileConfig(r.Context(), body.ProfileID)
+	} else {
+		cfg, err = a.readConfig(r.Context())
+	}
 	if err != nil {
 		writeError(w, 500, "读取配置失败")
 		return
