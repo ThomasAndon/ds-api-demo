@@ -19,6 +19,12 @@ OpenAI 兼容 URL、API Key、模型和温度由 `/admin` 配置，API Key 不�
 和 `title` 只用于兼容接收，不会透传给上游。上游请求只包含后台选择的模型、温度、
 普通 `user/assistant` 消息以及流式参数，本项目不发送 system 消息。
 
+例外是后台 URL 使用 `api.deepseek.com` 时：后端自动切换到 DeepSeek 官方
+`/anthropic/v1/messages` 协议，保留 `thinking`、`deepseek_web_search`、
+`deepseek_read_url` 和 `latest_reminder`，使官方前端的深入思考与智能搜索按钮生效；
+`system` 仍会被删除。其他 OpenAI 兼容中转站继续使用标准 `/chat/completions`，
+不会传递这些 DeepSeek 专用字段。
+
 生产部署见 [`deploy/README.md`](deploy/README.md)。
 
 ---

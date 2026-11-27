@@ -55,6 +55,32 @@ func TestOfficialFrontendRequestBecomesStandardOpenAIRequest(t *testing.T) {
 	}
 }
 
+func TestOfficialDeepSeekKeepsThinkingAndSearchWithoutSystem(t *testing.T) {
+	const frontendBody = `{"model":"deepseek-flash","system":"must not be forwarded","messages":[{"role":"latest_reminder","content":"date context"},{"role":"user","content":"search this"}],"thinking":{"type":"enabled"},"safety_check":{"level":"high"},"tools":[{"type":"deepseek_web_search","name":"deepseek_web_search"},{"type":"deepseek_read_url","name":"deepseek_read_url"}],"title":{"enabled":true},"stream":true}`
+	in, err := decodeChatRequest(strings.NewReader(frontendBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := buildDeepSeekNativeRequest(in, llmConfig{Model: "deepseek-chat"})
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(raw)
+	for _, required := range []string{`"model":"deepseek-chat"`, `"role":"latest_reminder"`, `"type":"enabled"`, `"deepseek_web_search"`, `"deepseek_read_url"`} {
+		if !strings.Contains(text, required) {
+			t.Fatalf("DeepSeek native payload lost %q: %s", required, text)
+		}
+	}
+	if strings.Contains(text, "must not be forwarded") || strings.Contains(text, `"system"`) {
+		t.Fatalf("DeepSeek native payload leaked system: %s", text)
+	}
+	endpoint, err := deepSeekMessagesURL("https://api.deepseek.com/v1")
+	if err != nil || endpoint != "https://api.deepseek.com/anthropic/v1/messages" {
+		t.Fatalf("unexpected DeepSeek endpoint %q, %v", endpoint, err)
+	}
+}
+
 func TestSecretRoundTripAndPasswordHash(t *testing.T) {
 	a := &app{key: sha256.Sum256([]byte("test-secret"))}
 	enc, err := a.encrypt("sk-private")

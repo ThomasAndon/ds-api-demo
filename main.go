@@ -327,13 +327,18 @@ type appMessage struct {
 	Content any    `json:"content"`
 }
 type chatRequest struct {
+	Model    string       `json:"model"`
+	System   string       `json:"system"`
 	Messages []appMessage `json:"messages"`
 	Thinking struct {
 		Type string `json:"type"`
 	} `json:"thinking"`
-	Title *struct {
+	SafetyCheck map[string]any   `json:"safety_check"`
+	Tools       []map[string]any `json:"tools"`
+	Title       *struct {
 		Enabled bool `json:"enabled"`
 	} `json:"title"`
+	Stream bool `json:"stream"`
 }
 
 type openAIMessage struct {
@@ -423,6 +428,10 @@ func (a *app) chat(w http.ResponseWriter, r *http.Request) {
 	}
 	if cfg.APIKey == "" {
 		writeError(w, 503, "请先在 /admin 配置 API Key")
+		return
+	}
+	if isOfficialDeepSeek(cfg.BaseURL) {
+		a.chatDeepSeekNative(w, r, in, cfg)
 		return
 	}
 	payload, lastUser, err := buildOpenAIRequest(in, cfg)
@@ -534,6 +543,91 @@ func (a *app) chat(w http.ResponseWriter, r *http.Request) {
 	sendEvent(w, "message_delta", map[string]any{"type": "message_delta", "delta": map[string]any{"stop_reason": "end_turn", "stop_sequence": nil, "title": title}})
 	sendEvent(w, "message_stop", map[string]any{"type": "message_stop"})
 	flusher.Flush()
+}
+
+func isOfficialDeepSeek(raw string) bool {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	return err == nil && strings.EqualFold(u.Hostname(), "api.deepseek.com")
+}
+
+func deepSeekMessagesURL(raw string) (string, error) {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || u.Scheme == "" || u.Host == "" || !strings.EqualFold(u.Hostname(), "api.deepseek.com") {
+		return "", errors.New("invalid DeepSeek URL")
+	}
+	u.Path = "/anthropic/v1/messages"
+	u.RawPath = ""
+	u.RawQuery = ""
+	u.Fragment = ""
+	return u.String(), nil
+}
+
+func buildDeepSeekNativeRequest(in chatRequest, cfg llmConfig) map[string]any {
+	payload := map[string]any{
+		"model":        cfg.Model,
+		"messages":     in.Messages,
+		"thinking":     in.Thinking,
+		"safety_check": in.SafetyCheck,
+		"tools":        in.Tools,
+		"stream":       true,
+	}
+	if in.Title != nil {
+		payload["title"] = in.Title
+	}
+	return payload
+}
+
+// DeepSeek 官方地址使用官方前端原生协议，让深度思考和智能搜索继续生效。
+// system 被刻意省略；模型和 API Key 始终来自后台配置。
+func (a *app) chatDeepSeekNative(w http.ResponseWriter, r *http.Request, in chatRequest, cfg llmConfig) {
+	endpoint, err := deepSeekMessagesURL(cfg.BaseURL)
+	if err != nil {
+		writeError(w, 500, "后台 URL 配置无效")
+		return
+	}
+	payload := buildDeepSeekNativeRequest(in, cfg)
+	body, _ := json.Marshal(payload)
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, endpoint, strings.NewReader(string(body)))
+	if err != nil {
+		writeError(w, 500, "创建上游请求失败")
+		return
+	}
+	req.Header.Set("x-api-key", cfg.APIKey)
+	req.Header.Set("Authorization", "Bearer "+cfg.APIKey)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "text/event-stream")
+	resp, err := a.httpClient.Do(req)
+	if err != nil {
+		writeError(w, 502, "连接模型服务失败: "+err.Error())
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		writeError(w, resp.StatusCode, "模型服务返回错误: "+strings.TrimSpace(string(b)))
+		return
+	}
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeError(w, 500, "服务器不支持流式响应")
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache, no-transform")
+	w.Header().Set("X-Accel-Buffering", "no")
+	buffer := make([]byte, 32*1024)
+	for {
+		n, readErr := resp.Body.Read(buffer)
+		if n > 0 {
+			if _, err := w.Write(buffer[:n]); err != nil {
+				return
+			}
+			flusher.Flush()
+		}
+		if readErr != nil {
+			return
+		}
+	}
 }
 
 func completionURL(raw string) (string, error) {
