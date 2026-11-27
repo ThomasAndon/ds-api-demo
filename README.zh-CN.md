@@ -1,4 +1,23 @@
-# chat-demo
+# ds-api-demo
+
+这是基于 DeepSeek Chat Demo 改造的私有前后端版本。React 前端只请求同源 Go 后端；
+OpenAI 兼容 URL、API Key、模型和温度由 `/admin` 配置，API Key 不会下发到浏览器。
+会话、重命名和删除均持久化到 MySQL。
+
+后台默认 API 根地址为 `https://la-api.vxvxvx.top/v1`，可通过上游 `/models`
+获取模型列表。前台保持官方项目的界面和 API Key 文案不变；输入值仅用于本站访问控制，
+不会作为上游 API Key 发送。
+
+核心接口：
+
+- `POST /api/chat/completions`：浏览器到 Go 的流式 LLM 接口；Go 再请求后台配置的 OpenAI 兼容服务。
+- `/api/sessions`：会话列表、详情、保存、重命名、删除和批量导入。
+- `/api/admin/config`：仅后台登录后可用的模型配置接口。
+- `GET /healthz`：应用和数据库健康检查。
+
+生产部署见 [`deploy/README.md`](deploy/README.md)。
+
+---
 
 [English](README.md) | 简体中文
 

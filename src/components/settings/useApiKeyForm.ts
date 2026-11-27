@@ -38,6 +38,7 @@ export const useApiKeyForm = (onSaved?: () => void) => {
       await verifyApiKey(apiKey)
       setApiKey(apiKey)
       setValue('')
+      window.dispatchEvent(new Event('ds-access-granted'))
       onSaved?.()
     } catch (e) {
       setFailure({ cause: e })
